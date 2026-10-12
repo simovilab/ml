@@ -1,0 +1,162 @@
+# Local development / testing stack. Mirrors production (same image, same
+# entrypoint, auth enabled, artifacts proxied) but brings its own PostgreSQL and
+# MinIO instead of db.simovi.org / s3.simovi.org.
+#
+#   scripts/init-secrets.sh dev
+#   docker compose -f compose.dev.yaml up -d --build --wait
+#   docker compose -f compose.dev.yaml --profile test run --rm smoke-test
+#
+# Host-side clients must set MLFLOW_ENABLE_PROXY_MULTIPART_DOWNLOAD=false and
+# MLFLOW_ENABLE_PROXY_MULTIPART_UPLOAD=false: MLflow hands out presigned URLs
+# pointing at http://minio:9000, which only resolves inside the compose network.
+#
+# UI:            http://localhost:5000   (user "admin", password: secrets/dev/mlflow_admin_password)
+# MinIO console: http://localhost:9001   (root creds: mlflow_s3_access_key / mlflow_s3_secret_key)
+#
+# Everything is bound to 127.0.0.1 only. Never use these settings on a server.
+
+name: mlflow-dev
+
+services:
+  postgres:
+    image: dhi.io/postgres:18
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: mlflow
+      POSTGRES_DB: mlflow
+      POSTGRES_PASSWORD_FILE: /run/secrets/mlflow_db_password
+    secrets:
+      - mlflow_db_password
+    volumes:
+      - pgdata:/var/lib/postgresql
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "mlflow", "-d", "mlflow"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    networks: [backend]
+
+  minio:
+    image: dhi.io/minio:0
+    restart: unless-stopped
+    command: ["server", "/data", "--console-address", ":9001"]
+    environment:
+      MINIO_ROOT_USER_FILE: /run/secrets/mlflow_s3_access_key
+      MINIO_ROOT_PASSWORD_FILE: /run/secrets/mlflow_s3_secret_key
+    secrets:
+      - mlflow_s3_access_key
+      - mlflow_s3_secret_key
+    volumes:
+      - minio-data:/data
+    ports:
+      - "127.0.0.1:9000:9000"
+      - "127.0.0.1:9001:9001"
+    networks: [backend]
+
+  # One-shot job: wait for MinIO, create the artifact bucket.
+  minio-init:
+    build: &mlflow-build
+      context: .
+    image: ml-mlflow:dev
+    entrypoint: ["/opt/mlflow/bin/python", "/opt/ml/init_bucket.py"]
+    environment:
+      MLFLOW_S3_ENDPOINT_URL: http://minio:9000
+      ML_BUCKET: mlflow
+    secrets:
+      - mlflow_s3_access_key
+      - mlflow_s3_secret_key
+    volumes:
+      - ./docker/init_bucket.py:/opt/ml/init_bucket.py:ro
+    depends_on:
+      - minio
+    restart: "no"
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    networks: [backend]
+
+  mlflow:
+    build: *mlflow-build
+    image: ml-mlflow:dev
+    restart: unless-stopped
+    init: true
+    environment:
+      ML_DB_HOST: postgres
+      ML_DB_SSLMODE: disable            # local container, no TLS
+      ML_ARTIFACTS_DESTINATION: s3://mlflow
+      # "mlflow:*" = in-network name used by the smoke-test container
+      ML_ALLOWED_HOSTS: "localhost:*,127.0.0.1:*,mlflow:*"
+      ML_CORS_ALLOWED_ORIGINS: "http://localhost:5000,http://127.0.0.1:5000"
+      ML_WORKERS: "2"
+      MLFLOW_S3_ENDPOINT_URL: http://minio:9000
+      MLFLOW_AUTH_ADMIN_USERNAME: admin
+    secrets:
+      - mlflow_db_password
+      - mlflow_s3_access_key
+      - mlflow_s3_secret_key
+      - mlflow_admin_password
+      - mlflow_flask_secret_key
+    ports:
+      - "127.0.0.1:5000:5000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      minio-init:
+        condition: service_completed_successfully
+    healthcheck:
+      test:
+        - CMD
+        - /opt/mlflow/bin/python
+        - -c
+        - "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:5000/health', timeout=5).status == 200 else 1)"
+      interval: 10s
+      timeout: 6s
+      retries: 6
+      start_period: 40s
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m,mode=1777
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    networks: [backend]
+
+  # Optional end-to-end check:  docker compose -f compose.dev.yaml --profile test run --rm smoke-test
+  smoke-test:
+    image: ml-mlflow:dev
+    profiles: [test]
+    entrypoint: ["/opt/mlflow/bin/python", "/opt/ml/smoke_test.py"]
+    environment:
+      MLFLOW_TRACKING_URI: http://mlflow:5000
+      MLFLOW_TRACKING_USERNAME: admin
+    secrets:
+      - mlflow_admin_password
+    volumes:
+      - ./docker/smoke_test.py:/opt/ml/smoke_test.py:ro
+    tmpfs:
+      - /tmp:size=64m,mode=1777
+    depends_on:
+      mlflow:
+        condition: service_healthy
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    networks: [backend]
+
+networks:
+  backend:
+
+volumes:
+  pgdata:
+  minio-data:
+
+secrets:
+  mlflow_db_password:
+    file: ${ML_SECRETS_DIR:-./secrets/dev}/mlflow_db_password
+  mlflow_s3_access_key:
+    file: ${ML_SECRETS_DIR:-./secrets/dev}/mlflow_s3_access_key
+  mlflow_s3_secret_key:
+    file: ${ML_SECRETS_DIR:-./secrets/dev}/mlflow_s3_secret_key
+  mlflow_admin_password:
+    file: ${ML_SECRETS_DIR:-./secrets/dev}/mlflow_admin_password
+  mlflow_flask_secret_key:
+    file: ${ML_SECRETS_DIR:-./secrets/dev}/mlflow_flask_secret_key

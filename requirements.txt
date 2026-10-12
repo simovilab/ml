@@ -1,0 +1,4 @@
+# Extra dependencies installed on top of the DHI MLflow image.
+# (psycopg2 and everything else MLflow needs is already in the base image;
+# Flask-WTF is added via the `mlflow[auth]` extra in the Dockerfile.)
+boto3==1.43.111

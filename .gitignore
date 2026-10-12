@@ -1,0 +1,15 @@
+# Secrets: never commit
+secrets/
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# Python / local artifacts
+__pycache__/
+*.pyc
+.venv/
+mlruns/
+mlartifacts/
+.DS_Store

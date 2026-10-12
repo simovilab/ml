@@ -1,0 +1,118 @@
+# Production: MLflow tracking server at https://ml.simovi.org
+#
+#   * PostgreSQL (backend + auth store) -> db.simovi.org   (external, TLS verified)
+#   * MinIO (artifact store)            -> s3.simovi.org   (external, via HTTPS)
+#   * TLS termination / routing         -> Traefik (labels below), reached over the
+#                                          external Docker network ${TRAEFIK_NETWORK:-traefik_proxy};
+#                                          no port is published on the host
+#
+#   scripts/init-secrets.sh prod              # once; then align db/s3 servers (README)
+#   docker compose -f compose.prod.yaml up -d --build --wait
+#
+# Non-secret settings can be overridden with environment variables / a .env file;
+# secrets are ONLY read from files in ML_SECRETS_DIR (default ./secrets/prod).
+#
+# Traefik settings that depend on your Traefik setup (override via env / .env):
+#   TRAEFIK_NETWORK       external network Traefik watches          (default: traefik_proxy)
+#   TRAEFIK_ENTRYPOINT    HTTPS entrypoint name                     (default: websecure)
+#   TRAEFIK_CERTRESOLVER  ACME certificate resolver name            (default: letsencrypt)
+# HTTP->HTTPS redirect is assumed to be configured on Traefik's `web` entrypoint.
+# Clients fetch/upload large artifacts straight from s3.simovi.org via presigned URLs
+# issued by MLflow, so s3.simovi.org must be reachable by them (see README).
+
+name: mlflow
+
+# Secret files are bind-mounted read-only at /run/secrets/<name>. Keep the
+# directory 0700 (scripts/init-secrets.sh does this); files are 0444 so that the
+# non-root container user (65532) can read them.
+
+services:
+  mlflow:
+    build:
+      context: .
+    image: ml-mlflow:${ML_IMAGE_TAG:-prod}
+    restart: unless-stopped
+    init: true
+    environment:
+      # --- PostgreSQL (db.simovi.org) ---
+      ML_DB_HOST: ${ML_DB_HOST:-db.simovi.org}
+      ML_DB_PORT: ${ML_DB_PORT:-5432}
+      ML_DB_NAME: ${ML_DB_NAME:-mlflow}
+      ML_DB_USER: ${ML_DB_USER:-mlflow}
+      ML_DB_SSLMODE: ${ML_DB_SSLMODE:-verify-full}
+      ML_DB_SSLROOTCERT: ${ML_DB_SSLROOTCERT:-system}
+      # --- MinIO (s3.simovi.org) ---
+      MLFLOW_S3_ENDPOINT_URL: ${MLFLOW_S3_ENDPOINT_URL:-https://s3.simovi.org}
+      ML_ARTIFACTS_DESTINATION: s3://${ML_BUCKET:-mlflow}
+      # --- Server / security ---
+      # Host header as forwarded by the reverse proxy + localhost for the healthcheck.
+      ML_ALLOWED_HOSTS: ml.simovi.org,localhost:*,127.0.0.1:*
+      ML_CORS_ALLOWED_ORIGINS: https://ml.simovi.org
+      ML_WORKERS: ${ML_WORKERS:-4}
+      ML_AUTH_DEFAULT_PERMISSION: ${ML_AUTH_DEFAULT_PERMISSION:-NO_PERMISSIONS}
+      MLFLOW_AUTH_ADMIN_USERNAME: ${MLFLOW_AUTH_ADMIN_USERNAME:-admin}
+    secrets:
+      - mlflow_db_password
+      - mlflow_s3_access_key
+      - mlflow_s3_secret_key
+      - mlflow_admin_password
+      - mlflow_flask_secret_key
+    networks:
+      - default            # outbound access to db.simovi.org / s3.simovi.org
+      - traefik            # shared with Traefik
+    labels:
+      traefik.enable: "true"
+      traefik.docker.network: ${TRAEFIK_NETWORK:-traefik_proxy}
+      # router
+      traefik.http.routers.mlflow.rule: Host(`ml.simovi.org`)
+      traefik.http.routers.mlflow.entrypoints: ${TRAEFIK_ENTRYPOINT:-websecure}
+      traefik.http.routers.mlflow.tls: "true"
+      traefik.http.routers.mlflow.tls.certresolver: ${TRAEFIK_CERTRESOLVER:-letsencrypt}
+      traefik.http.routers.mlflow.middlewares: mlflow-headers
+      # response security headers (Host is forwarded unchanged, as MLflow requires)
+      traefik.http.middlewares.mlflow-headers.headers.stsSeconds: "31536000"
+      traefik.http.middlewares.mlflow-headers.headers.stsIncludeSubdomains: "true"
+      traefik.http.middlewares.mlflow-headers.headers.contentTypeNosniff: "true"
+      # service: container port (Traefik skips the container while its healthcheck fails)
+      traefik.http.services.mlflow.loadbalancer.server.port: "5000"
+    healthcheck:
+      test:
+        - CMD
+        - /opt/mlflow/bin/python
+        - -c
+        - "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:5000/health', timeout=5).status == 200 else 1)"
+      interval: 30s
+      timeout: 8s
+      retries: 3
+      start_period: 60s
+    # --- container hardening ---
+    read_only: true
+    tmpfs:
+      - /tmp:size=128m,mode=1777
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    pids_limit: 512
+    mem_limit: ${ML_MEMORY_LIMIT:-2g}
+    cpus: ${ML_CPU_LIMIT:-2.0}
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
+
+networks:
+  traefik:
+    external: true
+    name: ${TRAEFIK_NETWORK:-traefik_proxy}
+
+secrets:
+  mlflow_db_password:
+    file: ${ML_SECRETS_DIR:-./secrets/prod}/mlflow_db_password
+  mlflow_s3_access_key:
+    file: ${ML_SECRETS_DIR:-./secrets/prod}/mlflow_s3_access_key
+  mlflow_s3_secret_key:
+    file: ${ML_SECRETS_DIR:-./secrets/prod}/mlflow_s3_secret_key
+  mlflow_admin_password:
+    file: ${ML_SECRETS_DIR:-./secrets/prod}/mlflow_admin_password
+  mlflow_flask_secret_key:
+    file: ${ML_SECRETS_DIR:-./secrets/prod}/mlflow_flask_secret_key
