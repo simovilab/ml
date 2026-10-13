@@ -50,9 +50,18 @@ create mlflow_flask_secret_key   "$(token 32)"   # CSRF key; keep identical acro
 if [[ $env == prod ]]; then
   cat <<EOF
 
-Next (prod): make the servers match these files. Either set the passwords of the
-'mlflow' role on db.simovi.org and the MinIO service account on s3.simovi.org to
-the generated values, or overwrite mlflow_db_password / mlflow_s3_* here with the
-credentials you already have. See README.md.
+Next (prod): make the backing services match these files. Either apply the
+generated values to the 'mlflow' database role and to the object-storage key --
+self-hosted PostgreSQL/MinIO or a managed cluster and hosted bucket alike -- or
+overwrite mlflow_db_password / mlflow_s3_* here with the credentials you already
+have.
+
+Then add the database CA certificate at:
+  $dir/ca-certificate.crt
+compose.prod.yaml always mounts it, so the file must exist. Use the CA of your
+managed cluster or private CA; when you verify against the system trust store
+(ML_DB_SSLROOTCERT=system) an empty placeholder is enough.
+
+See README.md.
 EOF
 fi

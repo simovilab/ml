@@ -41,9 +41,19 @@ services:
       ML_DB_USER: ${ML_DB_USER:-mlflow}
       ML_DB_SSLMODE: ${ML_DB_SSLMODE:-verify-full}
       ML_DB_SSLROOTCERT: ${ML_DB_SSLROOTCERT:-system}
+      # Every gunicorn worker opens its own tracking / model-registry / auth
+      # engine, so the server can demand workers x 3 x (pool + overflow)
+      # connections. Managed clusters cap max_connections (DO: 25 on small
+      # plans) -> keep the pools bounded and recycle idle connections.
+      MLFLOW_SQLALCHEMYSTORE_POOL_SIZE: ${ML_DB_POOL_SIZE:-5}
+      MLFLOW_SQLALCHEMYSTORE_MAX_OVERFLOW: ${ML_DB_MAX_OVERFLOW:-10}
+      MLFLOW_SQLALCHEMYSTORE_POOL_RECYCLE: ${ML_DB_POOL_RECYCLE:-1800}
       # --- MinIO (s3.simovi.org) ---
       MLFLOW_S3_ENDPOINT_URL: ${MLFLOW_S3_ENDPOINT_URL:-https://s3.simovi.org}
       ML_ARTIFACTS_DESTINATION: s3://${ML_BUCKET:-mlflow}
+      # SigV4 signing region: MinIO ignores it, but S3-compatible services such as
+      # DigitalOcean Spaces reject requests signed for the wrong region.
+      AWS_DEFAULT_REGION: ${ML_S3_REGION:-us-east-1}
       # --- Server / security ---
       # Host header as forwarded by the reverse proxy + localhost for the healthcheck.
       ML_ALLOWED_HOSTS: ml.simovi.org,localhost:*,127.0.0.1:*
